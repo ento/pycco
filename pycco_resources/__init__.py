@@ -14,6 +14,9 @@ a {
   a:visited {
     color: #261a3b;
   }
+u {
+  text-decoration: underline;
+}
 p {
   margin: 0 0 15px 0;
 }
@@ -191,12 +194,12 @@ body .vi { color: #19469D }                     /* Name.Variable.Instance */
 body .il { color: #666666 }                     /* Literal.Number.Integer.Long */
 """
 
-html = """\
+html = u"""\
 <!DOCTYPE html>
 <html>
 <head>
   <meta http-equiv="content-type" content="text/html;charset=utf-8">
-  <title>{{ title }}</title>
+  <title>{{ translation_title }} - {{ source_title }}</title>
   <link rel="stylesheet" href="{{ stylesheet }}">
 </head>
 <body>
@@ -215,19 +218,20 @@ html = """\
   </div>
   {{/sources?}}
   <div class='section'>
-    <div class='docs'><h1>{{ title }}</h1></div>
+    <div class='docs' lang='{{ translation_language }}'><h1>{{ translation_title }}</h1></div>
+    <div class='code' lang='{{ source_language }}'><h1>{{ source_title }}</h1></div>
   </div>
   <div class='clearall'>
   {{#sections}}
   <div class='section' id='section-{{ num }}'>
-    <div class='docs'>
+    <div class='docs' lang='{{ translation_language }}'>
       <div class='octowrap'>
         <a class='octothorpe' href='#section-{{ num }}'>#</a>
+      {{{ translation_html }}}
       </div>
-      {{{ docs_html }}}
     </div>
-    <div class='code'>
-      {{{ code_html }}}
+    <div class='code' lang='{{ source_language }}'>
+      {{{ source_html }}}
     </div>
   </div>
   <div class='clearall'></div>

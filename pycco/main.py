@@ -31,120 +31,194 @@ Or, to install the latest source
     python setup.py install
 """
 
+
+renderer_flavors = {
+    'markdown': {
+        'multistart': '```',
+        'multiend': '```',
+    }
+}
+default_render_opts = {'name': 'markdown', 'kwargs': {}}
+renderers = {}
+
+
+try:
+    from markdown import markdown
+    renderers['markdown'] = {
+        'func': markdown,
+        'flavor': 'markdown',
+        'defaults': {
+            'extensions': ['fenced_code', 'attr_list'],
+        },
+    }
+except ImportError:
+    pass
+
+try:
+    from markdown2 import markdown
+    renderers['markdown2'] = {
+        'func': markdown,
+        'flavor': 'markdown',
+        'defaults': {
+            'extras': ['fenced-code-block'],
+        },
+    }
+except ImportError:
+    pass
+
+try:
+    import misaka
+    def preprocess_misaka_kwargs(kwargs):
+        for key in ('extensions', 'render_flags'):
+            kwargs[key] = reduce(operator.or_, [getattr(misaka, attr) for attr in kwargs.pop(key, [])], 0)
+        return kwargs
+    renderers['misaka'] = {
+        'func': misaka.html,
+        'preprocess_kwargs': preprocess_misaka_kwargs,
+        'flavor': 'markdown',
+        'defaults': {
+            'extensions': ['EXT_FENCED_CODE'],
+        },
+    }
+except ImportError:
+    pass
+
+
+for name, renderer in renderers.iteritems():
+    renderer.update(renderer_flavors[renderer['flavor']])
+
+
+def prepare_renderer(render_opts):
+    renderer = renderers[render_opts['name']]
+    render_func = renderer['func']
+    kwargs = dict(renderer['defaults'], **render_opts['kwargs'])
+
+    if renderer.get('preprocess_kwargs'):
+        kwargs = renderer['preprocess_kwargs'](kwargs)
+    
+    def render(source):
+        return render_func(source, **kwargs)
+
+    return {
+        'func': render,
+        'multistart': renderer['multistart'],
+        'multiend': renderer['multiend'],
+    }
+
+
+default_renderer = prepare_renderer(default_render_opts)
+
+
 # === Main Documentation Generation Functions ===
 
-def generate_documentation(source, outdir=None, preserve_paths=True,
-                           language=None):
+def generate_translations(source, destination, language=None, renderer=default_renderer):
     """
-    Generate the documentation for a source file by reading it in, splitting it
-    up into comment/code sections, highlighting them for the appropriate
-    language, and merging them into an HTML template.
+    Generate side-by-side translations for a source document by reading it in,
+    listing up translations in the same directory, splitting them
+    up into sections and merging them into an HTML template.
     """
 
-    if not outdir:
-        raise TypeError("Missing the required 'outdir' keyword argument.")
-    code = open(source, "r").read()
-    language = get_language(source, code, language=language)
-    sections = parse(source, code, language)
-    highlight(source, sections, language, preserve_paths=preserve_paths, outdir=outdir)
-    return generate_html(source, sections, preserve_paths=preserve_paths, outdir=outdir)
+    text = codecs.open(source, "r", "utf8").read()
+    source_doc = parse(source, text, language=language, renderer=renderer)
+    highlight(source, source_doc, renderer, destination)
+    for translation in get_translations(source):
+        text = codecs.open(translation, "r", "utf8").read()
+        translated_doc = parse(translation, text, language=language, renderer=renderer)
+        highlight(translation, translated_doc, renderer, destination)
+        doc = merge_docs(source_doc, translated_doc)
+        yield translation, generate_html(source, translation, doc, destination)
 
-def parse(source, code, language):
+
+def parse(source, text, language=None, renderer=default_renderer):
     """
-    Given a string of source code, parse out each comment and the code that
-    follows it, and create an individual **section** for it.
+    Given a string of text, determine the title and split the rest into **section**s.
     Sections take the form:
 
-        { "docs_text": ...,
-          "docs_html": ...,
-          "code_text": ...,
-          "code_html": ...,
-          "num":       ...
+        { "text": ...,
+          "html": ...,
+          "num":  ...
         }
     """
+    language = get_language(source, text, language=language)
 
-    lines = code.split("\n")
+    lines = text.split("\n")
     sections = []
-    has_code = docs_text = code_text = ""
+    chunk = ''
 
     if lines[0].startswith("#!"):
         lines.pop(0)
 
-    if language["name"] == "python":
-        for linenum, line in enumerate(lines[:2]):
-            if re.search(r'coding[:=]\s*([-\w.]+)', lines[linenum]):
-                lines.pop(linenum)
-                break
-
-
-    def save(docs, code):
-        if docs or code:
+    def save(chunk):
+        if chunk:
             sections.append({
-                "docs_text": docs,
-                "code_text": code
+                "text": chunk,
             })
 
-    # Setup the variables to get ready to check for multiline comments
+    title = lines.pop(0)
+
+    # Setup the variables to get ready to check for multiline chunks
     multi_line = False
-    multi_line_delimiters = [language.get("multistart"), language.get("multiend")]
+    multi_line_delimiters = [renderer.get("multistart"), renderer.get("multiend")]
 
     for line in lines:
-
-        # Only go into multiline comments section when one of the delimiters is
-        # found to be at the start of a line
         if all(multi_line_delimiters) and any([line.lstrip().startswith(delim) or line.rstrip().endswith(delim) for delim in multi_line_delimiters]):
             if not multi_line:
                 multi_line = True
-
             else:
                 multi_line = False
 
             if (multi_line
-               and line.strip().endswith(language.get("multiend"))
-               and len(line.strip()) > len(language.get("multiend"))):
+               and line.strip().endswith(renderer.get("multiend"))
+               and len(line.strip()) > len(renderer.get("multiend"))):
                 multi_line = False
 
-            # Get rid of the delimiters so that they aren't in the final docs
-            line = line.replace(language["multistart"], '')
-            line = line.replace(language["multiend"], '')
-            docs_text += line.strip() + '\n'
-            indent_level = re.match("\s*", line).group(0)
+            # Get rid of the delimiters so that they aren't in the
+            # final docs
+            if renderer.get("strip_multi_delimiters"):
+                line = line.replace(renderer["multistart"], '')
+                line = line.replace(renderer["multiend"], '')
 
-            if has_code and docs_text.strip():
-                save(docs_text, code_text[:-1])
-                code_text = code_text.split('\n')[-1]
-                has_code = docs_text = ''
+            if not multi_line:
+                chunk += '\n' + line
+
+            if chunk:
+                save(chunk)
+                chunk = ''
+
+            if multi_line:
+                chunk += line
 
         elif multi_line:
-            # Remove leading spaces
-            if re.match(r' {%d}' % len(indent_level), line):
-                docs_text += line[len(indent_level):] + '\n'
-            else:
-                docs_text += line + '\n'
-
-        elif re.match(language["comment_matcher"], line):
-            if has_code:
-                save(docs_text, code_text)
-                has_code = docs_text = code_text = ''
-            docs_text += re.sub(language["comment_matcher"], "", line) + "\n"
-
+            chunk += '\n' + line
+        elif line:
+            chunk += '\n' + line
         else:
-            if code_text and any([line.lstrip().startswith(x) for x in ['class ', 'def ', '@']]):
-                if not code_text.lstrip().startswith("@"):
-                    save(docs_text, code_text)
-                    code_text = has_code = docs_text = ''
+            save(chunk)
+            chunk = ''
 
-            has_code = True
-            code_text += line + '\n'
+    save(chunk)
+    return {'title': title, 'sections': sections, 'language': language}
 
 
-    save(docs_text, code_text)
+def merge_docs(source_doc, translation_doc):
+    doc = {
+        'source_title': source_doc['title'],
+        'translation_title': translation_doc['title'],
+        'source_language': source_doc['language'],
+        'translation_language': translation_doc['language'],
+        'sections': []}
+    get_html = lambda section: (section or {}).get('html', '')
+    for i, (source_section, translation_section) in enumerate(itertools.izip_longest(source_doc['sections'], translation_doc['sections'])):
+        doc['sections'].append(dict(
+            num=i,
+            source_html=get_html(source_section),
+            translation_html=get_html(translation_section)))
+    return doc
 
-    return sections
 
 # === Preprocessing the comments ===
 
-def preprocess(comment, section_nr, preserve_paths=True, outdir=None):
+def preprocess(comment, section_nr, destination):
     """
     Add cross-references before having the text processed by markdown.  It's
     possible to reference another file, like this : `[[main.py]]` which renders
@@ -155,8 +229,6 @@ def preprocess(comment, section_nr, preserve_paths=True, outdir=None):
     `=== like this ===`
     """
 
-    if not outdir:
-        raise TypeError("Missing the required 'outdir' keyword argument.")
     def sanitize_section_name(name):
         return "-".join(name.lower().strip().split(" "))
 
@@ -165,16 +237,12 @@ def preprocess(comment, section_nr, preserve_paths=True, outdir=None):
         if '#' in match.group(1):
             name, anchor = match.group(1).split('#')
             return " [%s](%s#%s)" % (name,
-                                     path.basename(destination(name,
-                                                               preserve_paths=preserve_paths,
-                                                               outdir=outdir)),
+                                     path.basename(destination(name)),
                                      anchor)
 
         else:
             return " [%s](%s)" % (match.group(1),
-                                  path.basename(destination(match.group(1),
-                                                            preserve_paths=preserve_paths,
-                                                            outdir=outdir)))
+                                  path.basename(destination(match.group(1))))
 
     def replace_section_name(match):
         return '%(lvl)s <span id="%(id)s" href="%(id)s">%(name)s</span>' % {
@@ -190,7 +258,7 @@ def preprocess(comment, section_nr, preserve_paths=True, outdir=None):
 
 # === Highlighting the source code ===
 
-def highlight(source, sections, language, preserve_paths=True, outdir=None):
+def highlight(source, doc, renderer, destination):
     """
     Highlights a single chunk of code using the **Pygments** module, and runs
     the text of its corresponding comment through **Markdown**.
@@ -200,58 +268,44 @@ def highlight(source, sections, language, preserve_paths=True, outdir=None):
     wherever our markers occur.
     """
 
-    if not outdir:
-        raise TypeError("Missing the required 'outdir' keyword argument.")
-
-    output = pygments.highlight(language["divider_text"].join(section["code_text"].rstrip() for section in sections),
-                                language["lexer"],
-                                formatters.get_formatter_by_name("html"))
-
-    output = output.replace(highlight_start, "").replace(highlight_end, "")
-    fragments = re.split(language["divider_html"], output)
-    for i, section in enumerate(sections):
-        section["code_html"] = highlight_start + shift(fragments, "") + highlight_end
+    for i, section in enumerate(doc['sections']):
         try:
-            docs_text = unicode(section["docs_text"])
+            text = unicode(section["text"])
         except UnicodeError:
-            docs_text = unicode(section["docs_text"].decode('utf-8'))
-        section["docs_html"] = markdown(preprocess(docs_text,
-                                                   i,
-                                                   preserve_paths=preserve_paths,
-                                                   outdir=outdir))
+            text = unicode(section["text"].decode('utf-8'))
+        preprocessed = preprocess(text, i, destination)
+        section["html"] = renderer['func'](preprocessed)
         section["num"] = i
 
 # === HTML Code generation ===
 
-def generate_html(source, sections, preserve_paths=True, outdir=None):
+def generate_html(source, translation, doc, destination):
     """
-    Once all of the code is finished highlighting, we can generate the HTML file
-    and write out the documentation. Pass the completed sections into the
+    Once all of the section is merged, we can generate the HTML file
+    and write out the translation. Pass the completed sections into the
     template found in `resources/pycco.html`.
 
     Pystache will attempt to recursively render context variables, so we must
-    replace any occurences of `{{`, which is valid in some languages, with a
-    "unique enough" identifier before rendering, and then post-process the
-    rendered template and change the identifier back to `{{`.
+    replace any occurences of `{{`, with a "unique enough" identifier before
+    rendering, and then post-process the rendered template and change the
+    identifier back to `{{`.
     """
 
-    if not outdir:
-        raise TypeError("Missing the required 'outdir' keyword argument")
-    title = path.basename(source)
-    dest = destination(source, preserve_paths=preserve_paths, outdir=outdir)
-    csspath = path.relpath(path.join(outdir, "pycco.css"), path.split(dest)[0])
+    dest = destination(source)
+    csspath = path.relpath(destination("pycco.css", override_ext=None), path.split(dest)[0])
 
-    for sect in sections:
-        sect["code_html"] = re.sub(r"\{\{", r"__DOUBLE_OPEN_STACHE__", sect["code_html"])
+    for sect in doc['sections']:
+        for key in ('source_html', 'translation_html'):
+            sect[key] = re.sub(r"\{\{", r"__DOUBLE_OPEN_STACHE__", sect[key])
 
-    rendered = pycco_template({
-        "title"       : title,
+    context = {
         "stylesheet"  : csspath,
-        "sections"    : sections,
         "source"      : source,
         "path"        : path,
-        "destination" : destination
-    })
+        "destination" : dest
+    }
+    context.update(doc)
+    rendered = pycco_template(context)
 
     return re.sub(r"__DOUBLE_OPEN_STACHE__", "{{", rendered).encode("utf-8")
 
@@ -263,92 +317,42 @@ import pycco_resources
 # Import our external dependencies.
 import optparse
 import os
-import pygments
+import codecs
+import itertools
+import json
+import glob
+import operator
 import pystache
 import re
 import sys
 import time
-from markdown import markdown
 from os import path
-from pygments import lexers, formatters
+from babel import Locale
 
-# A list of the languages that Pycco supports, mapping the file extension to
-# the name of the Pygments lexer and the symbol that indicates a comment. To
-# add another language to Pycco's repertoire, add it here.
-languages = {
-    ".coffee": { "name": "coffee-script", "symbol": "#",
-        "multistart": '###', "multiend": '###' },
-
-    ".pl":  { "name": "perl", "symbol": "#" },
-
-    ".sql": { "name": "sql", "symbol": "--" },
-
-    ".c":   { "name": "c", "symbol": "//",
-        "multistart": "/*", "multiend": "*/"},
-
-    ".cpp": { "name": "cpp", "symbol": "//"},
-
-    ".js": { "name": "javascript", "symbol": "//",
-        "multistart": "/*", "multiend": "*/"},
-
-    ".rb": { "name": "ruby", "symbol": "#",
-        "multistart": "=begin", "multiend": "=end"},
-
-    ".py": { "name": "python", "symbol": "#",
-        "multistart": '"""', "multiend": '"""' },
-
-    ".scm": { "name": "scheme", "symbol": ";;",
-        "multistart": "#|", "multiend": "|#"},
-
-    ".lua": { "name": "lua", "symbol": "--",
-        "multistart": "--[[", "multiend": "--]]"},
-
-    ".erl": { "name": "erlang", "symbol": "%%" },
-
-    ".tcl":  { "name": "tcl", "symbol": "#" },
-
-    ".hs": { "name": "haskell", "symbol": "--",
-        "multistart": "{-", "multiend": "-}"},
-}
-
-# Build out the appropriate matchers and delimiters for each language.
-for ext, l in languages.items():
-    # Does the line begin with a comment?
-    l["comment_matcher"] = re.compile(r"^\s*" + l["symbol"] + "\s?")
-
-    # The dividing token we feed into Pygments, to delimit the boundaries between
-    # sections.
-    l["divider_text"] = "\n" + l["symbol"] + "DIVIDER\n"
-
-    # The mirror of `divider_text` that we expect Pygments to return. We can split
-    # on this to recover the original sections.
-    l["divider_html"] = re.compile(r'\n*<span class="c[1]?">' + l["symbol"] + 'DIVIDER</span>\n*')
-
-    # Get the Pygments Lexer for this language.
-    l["lexer"] = lexers.get_lexer_by_name(l["name"])
 
 def get_language(source, code, language=None):
-    """Get the current language we're documenting, based on the extension."""
+    """Get the source language, based on the basename."""
 
     if language is not None:
-        for l in languages.values():
-            if l["name"] == language:
-                return l
+        locale = Locale.parse(language)
+        if locale:
+            return locale.language
         else:
             raise ValueError("Unknown forced language: " + language)
 
-    m = re.match(r'.*(\..+)', os.path.basename(source))
-    if m and m.group(1) in languages:
-        return languages[m.group(1)]
-    else:
-        lang = lexers.guess_lexer(code).name.lower()
-        for l in languages.values():
-            if l["name"] == lang:
-                return l
-        else:
-            raise ValueError("Can't figure out the language!")
+    m = re.match(r'(.*)(\..+)', os.path.basename(source))
+    if m:
+        locale = Locale.parse(m.group(1))
+        if locale:
+            return locale.language
+    raise ValueError("Can't figure out the language!")
 
-def destination(filepath, preserve_paths=True, outdir=None):
+
+def get_translations(source):
+    return [filepath for filepath in glob.iglob(os.path.join(os.path.dirname(source), '*.md')) if filepath != source]
+
+
+def destination(filepath, preserve_paths=True, strip_paths=0, outdir=None, override_ext='.html'):
     """
     Compute the destination HTML path for an input source file path. If the
     source is `lib/example.py`, the HTML will be at `docs/example.html`
@@ -357,13 +361,15 @@ def destination(filepath, preserve_paths=True, outdir=None):
     dirname, filename = path.split(filepath)
     if not outdir:
         raise TypeError("Missing the required 'outdir' keyword argument.")
-    try:
-        name = re.sub(r"\.[^.]*$", "", filename)
-    except ValueError:
-        name = filename
+    name = filename
+    if override_ext:
+        try:
+            name = re.sub(r"\.[^.]*$", override_ext, filename)
+        except ValueError:
+            pass
     if preserve_paths:
-        name = path.join(dirname, name)
-    return path.join(outdir, "%s.html" % name)
+        name = path.join(os.sep.join(dirname.split(os.sep)[strip_paths:]), name)
+    return path.join(outdir, name)
 
 def shift(list, default):
     """
@@ -391,13 +397,8 @@ pycco_template = template(pycco_resources.html)
 # The CSS styles we'd like to apply to the documentation.
 pycco_styles = pycco_resources.css
 
-# The start of each Pygments highlight block.
-highlight_start = "<div class=\"highlight\"><pre>"
 
-# The end of each Pygments highlight block.
-highlight_end = "</pre></div>"
-
-def process(sources, preserve_paths=True, outdir=None, language=None):
+def process(sources, preserve_paths=True, strip_paths=0, outdir=None, language=None, render_opts=default_render_opts):
     """For each source file passed as argument, generate the documentation."""
 
     if not outdir:
@@ -409,31 +410,40 @@ def process(sources, preserve_paths=True, outdir=None, language=None):
 
     # Proceed to generating the documentation.
     if sources:
+        def get_destination(source, **kwargs):
+            return destination(source, preserve_paths=preserve_paths, strip_paths=strip_paths, outdir=outdir, **kwargs)
+
         ensure_directory(outdir)
-        css = open(path.join(outdir, "pycco.css"), "w")
+        css = open(get_destination("pycco.css", override_ext=None), "w")
         css.write(pycco_styles)
         css.close()
 
+        renderer = prepare_renderer(render_opts)
+
         def next_file():
             s = sources.pop(0)
-            dest = destination(s, preserve_paths=preserve_paths, outdir=outdir)
-
+            dest = get_destination(s)
             try:
                 os.makedirs(path.split(dest)[0])
             except OSError:
                 pass
 
-            with open(dest, "w") as f:
-                f.write(generate_documentation(s, preserve_paths=preserve_paths, outdir=outdir,
-                                               language=language))
+            for filepath, translation in generate_translations(
+                    s,
+                    destination=get_destination,
+                    language=language,
+                    renderer=renderer):
+                dest = get_destination(filepath)
+                with open(dest, "w") as f:
+                    f.write(translation)
 
-            print "pycco = %s -> %s" % (s, dest)
+                print "pycco = %s -> %s" % (s, dest)
 
             if sources:
                 next_file()
         next_file()
 
-__all__ = ("process", "generate_documentation")
+__all__ = ("process", "generate_translations")
 
 
 def monitor(sources, opts):
@@ -482,9 +492,17 @@ def monitor(sources, opts):
 def main():
     """Hook spot for the console script."""
 
+    def to_json(option, _, value, parser):
+        return setattr(parser.values, option.dest, json.loads(value))
+
     parser = optparse.OptionParser()
     parser.add_option('-p', '--paths', action='store_true',
+                      default=False,
                       help='Preserve path structure of original files')
+
+    parser.add_option('--strip-paths NUM', type='int',
+                      dest='strip_paths', default=0,
+                      help='When preserving path, strip NUM path components from the beginning of original files')
 
     parser.add_option('-d', '--directory', action='store', type='string',
                       dest='outdir', default='docs',
@@ -493,13 +511,21 @@ def main():
     parser.add_option('-w', '--watch', action='store_true',
                       help='Watch original files and re-generate documentation on changes')
 
-    parser.add_option('-l', '--force-language', action='store', type='string',
+    parser.add_option('-s', '--source-language', action='store', type='string',
                       dest='language', default=None,
-                      help='Force the language for the given files')
+                      help='Default source language')
+
+    parser.add_option('-r', '--renderer-name', action='store', type='string',
+                      dest='renderer_name', default=default_render_opts['name'],
+                      help='Text rendering engine')
+
+    parser.add_option('--renderer-opts', action='callback', type='string', callback=to_json,
+                      dest='renderer_opts', default=default_render_opts['kwargs'],
+                      help='Additional kwargs in JSON to pass to the text rendering engine')
     opts, sources = parser.parse_args()
 
-    process(sources, outdir=opts.outdir, preserve_paths=opts.paths,
-            language=opts.language)
+    process(sources, outdir=opts.outdir, preserve_paths=opts.paths, strip_paths=opts.strip_paths,
+            language=opts.language, render_opts={'name': opts.renderer_name, 'kwargs': opts.renderer_opts})
 
     # If the -w / --watch option was present, monitor the source directories
     # for changes and re-generate documentation for source files whenever they

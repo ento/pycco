@@ -15,6 +15,6 @@ setup(
                 'pycco = pycco.main:main',
                 ]
             },
-        install_requires = ['markdown', 'pygments', 'pystache', 'smartypants'],
+        install_requires = ['markdown', 'pygments', 'pystache', 'smartypants', 'babel'],
         extras_require = {'monitoring': 'watchdog'},
         )
